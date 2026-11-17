@@ -17,6 +17,7 @@
 #                      없으므로, dry-run·none은 부하가 끝나 VM이 돌아온 뒤에 로그를 가져온다
 #   --observe-sec N    T0가 없을 때 기다리는 시간 (기본: normal_burst 300, 그 밖 600)
 #   --baseline-sec N   부하 전 기준 구간 (기본 15)
+#   --mlock yes|no     데몬의 mlockall 설정 (기본: 설정 파일 기본값 yes). no는 mlock 대조군(이슈 #6). 데몬을 쓰는 실행에만 적용
 #   --pin-mib N        mlock으로 고정할 메모리 (기본 43, 길벗의 회수 불가 메모리 모사. 0이면 쓰지 않는다)
 #   --anon-mib N       runaway_growth·spike_mem의 목표 크기 (기본 650)
 #   --rate-mib N       runaway_growth의 초당 증가량 (기본 4)
@@ -45,6 +46,7 @@ LOAD_SEC=600
 OBSERVE_SEC=""
 BASELINE_SEC=15
 PIN_MIB=43
+MLOCK=""
 ANON_MIB=650
 RATE_MIB=4
 BURST_MIB=""
@@ -62,6 +64,7 @@ while [ $# -gt 0 ]; do
         --load-sec) LOAD_SEC="$2"; shift 2 ;;
         --observe-sec) OBSERVE_SEC="$2"; shift 2 ;;
         --baseline-sec) BASELINE_SEC="$2"; shift 2 ;;
+        --mlock) MLOCK="$2"; shift 2 ;;
         --pin-mib) PIN_MIB="$2"; shift 2 ;;
         --anon-mib) ANON_MIB="$2"; shift 2 ;;
         --rate-mib) RATE_MIB="$2"; shift 2 ;;
@@ -80,6 +83,11 @@ case "$DAEMON" in
     none|dry|kill) ;;
     *) echo "--daemon은 none, dry, kill 중 하나여야 한다" >&2; exit 2 ;;
 esac
+case "$MLOCK" in
+    ""|yes|no) ;;
+    *) echo "--mlock은 yes 또는 no여야 한다" >&2; exit 2 ;;
+esac
+[ -z "$MLOCK" ] || [ "$DAEMON" != none ] || { echo "--mlock은 데몬을 쓰는 실행(--daemon dry|kill)에만 쓴다" >&2; exit 2; }
 
 # 부하별 기본값
 case "$LOAD" in
@@ -184,6 +192,10 @@ if [ "$DAEMON" != none ]; then
 target_parent = /sys/fs/cgroup/system.slice
 target_match = tg-load.service,tg-canary.service
 EOF
+    # mlock 대조군: 지정했을 때만 덧붙인다. 지정하지 않으면 기존 실행과 같다.
+    if [ -n "$MLOCK" ]; then
+        vm_run 30 "echo 'mlock = $MLOCK' | sudo tee -a /etc/thrash-guard/thrash-guard.conf >/dev/null"
+    fi
     vm_run 60 "sudo bash -s -- '$flag'" <<'EOF'
 set -e
 install -m0755 /tmp/thrash-guard /usr/local/sbin/thrash-guard
@@ -196,6 +208,15 @@ EOF
         || { echo "데몬이 시작되지 않았다" >&2; vm_run 30 'sudo journalctl -u thrash-guard --no-pager | tail -20' >&2 || true; exit 1; }
     vm_run 30 'grep ExecStart= /etc/systemd/system/thrash-guard.service' >"$OUT/daemon_exec.txt"
     log "데몬 시작: $(cat "$OUT/daemon_exec.txt")"
+    # 데몬의 VmLck(kB). mlock을 지정한 실행은 설정이 적용됐는지 확인하고 어긋나면 중단한다(no는 0, yes는 0보다 큼).
+    daemon_vmlck="$(vm_run 30 'awk "/VmLck/{print \$2}" /proc/$(systemctl show -p MainPID --value thrash-guard)/status' | tr -d '[:space:]')"
+    echo "$daemon_vmlck" >"$OUT/daemon_vmlck.txt"
+    log "데몬 VmLck=${daemon_vmlck}kB"
+    case "$daemon_vmlck" in ''|*[!0-9]*) echo "데몬 VmLck를 읽지 못했다" >&2; exit 1 ;; esac
+    if { [ "$MLOCK" = no ] && [ "$daemon_vmlck" -ne 0 ]; } || { [ "$MLOCK" = yes ] && [ "$daemon_vmlck" -eq 0 ]; }; then
+        echo "mlock=$MLOCK 설정이 적용되지 않았다(VmLck=${daemon_vmlck}kB)" >&2
+        exit 1
+    fi
 fi
 
 # 필수 프로세스 E: 응답 서버(카나리). oom_score_adj=-1000으로 보호한다.
@@ -254,7 +275,7 @@ esac
 
 # 실행 조건 기록. 계산 결과는 끝난 뒤 result.json에 합친다.
 RUN_ID="$ID" LOAD="$LOAD" LOAD_ARGS="$LOAD_ARGS" DAEMON="$DAEMON" CAP_SEC="$CAP_SEC" LOAD_SEC="$LOAD_SEC" \
-OBSERVE_SEC="$OBSERVE_SEC" BASELINE_SEC="$BASELINE_SEC" PIN_MIB="$PIN_MIB" \
+OBSERVE_SEC="$OBSERVE_SEC" BASELINE_SEC="$BASELINE_SEC" PIN_MIB="$PIN_MIB" MLOCK="$MLOCK" DAEMON_VMLCK="${daemon_vmlck:-}" \
 LOAD_PREEXISTING="$LOAD_PREEXISTING" IO_IOPS="$VM_IOPS" IO_BPS="$VM_BPS" LOAD_START_NS="$LOAD_START_NS" OFFSET_NS="$CLOCK_OFFSET_START_NS" \
 python3 - "$OUT/run.json" <<'EOF'
 import json, os, sys
@@ -264,6 +285,8 @@ json.dump({
     "cap_sec": int(e["CAP_SEC"]), "load_sec": int(e["LOAD_SEC"]), "observe_sec": int(e["OBSERVE_SEC"]),
     "load_preexisting": e["LOAD_PREEXISTING"] == "true",
     "baseline_sec": int(e["BASELINE_SEC"]), "pin_mib": int(e["PIN_MIB"]),
+    "mlock": e["MLOCK"] or None,
+    "daemon_vmlck_kb": int(e["DAEMON_VMLCK"]) if e["DAEMON_VMLCK"] else None,
     "io_limit": {"iops": int(e["IO_IOPS"]), "bytes_per_sec": int(e["IO_BPS"])},
     "load_start_unix_ns": int(e["LOAD_START_NS"]), "guest_clock_offset_ns": int(e["OFFSET_NS"]),
 }, open(sys.argv[1], "w"), ensure_ascii=False, indent=2)
