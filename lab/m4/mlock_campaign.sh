@@ -11,10 +11,13 @@ OUT="${2:?결과 디렉터리}"
 START="${3:-1}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 mkdir -p "$OUT"
+FAILED=0
 for n in $(seq "$START" $((START + N - 1))); do
     for arm in yes no; do
         id="mlock${arm}-$n"
         "$HERE/run.sh" --load runaway_growth --daemon kill --mlock "$arm" --id "$id" --out "$OUT/$id" \
-            > "$OUT/$id.out" 2>&1 || echo "$id 실패(rc=$?)" | tee -a "$OUT/failures.txt"
+            > "$OUT/$id.out" 2>&1 || { echo "$id 실패(rc=$?)" | tee -a "$OUT/failures.txt"; FAILED=1; }
     done
 done
+# 하나라도 실패했으면 비정상 종료한다(나머지 실행은 계속 한다).
+exit "$FAILED"
